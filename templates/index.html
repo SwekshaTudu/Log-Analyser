@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Log Analyser</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 1100px; padding: 0 1rem; color: #222; }
+  section { margin: 1.2rem 0; }
+  .card { display: inline-block; border: 1px solid #ccc; border-radius: 8px; padding: .8rem 1.2rem; margin-right: .8rem; min-width: 120px; }
+  .card b { display: block; font-size: 1.6rem; }
+  canvas { max-height: 220px; }
+  table { border-collapse: collapse; width: 100%; font-size: .9rem; }
+  th, td { border: 1px solid #ddd; padding: .35rem .5rem; text-align: left; vertical-align: top; }
+  th { background: #f4f4f4; }
+  .badge { display: inline-block; padding: .1rem .45rem; border-radius: 4px; color: #fff; font-size: .78rem; font-weight: 600; }
+  .badge.DEBUG { background: #888; } .badge.INFO { background: #2b7cd3; }
+  .badge.WARN { background: #e8912d; } .badge.ERROR { background: #d64545; }
+  .badge.FATAL { background: #8e2de2; } .badge.TRACE { background: #aaa; }
+  td.msg { white-space: pre-wrap; word-break: break-word; max-width: 60ch; }
+  .expand { cursor: pointer; color: #2b7cd3; font-size: .8rem; }
+  #error-box { background: #fdecea; border: 1px solid #f5c6c0; color: #a33; padding: .6rem .8rem; border-radius: 6px; margin: 1rem 0; }
+  #empty { color: #777; padding: 1rem; border: 1px dashed #ccc; border-radius: 6px; }
+  fieldset { border: 1px solid #ccc; border-radius: 6px; display: inline-block; }
+  label { margin-right: .8rem; font-size: .9rem; }
+  button { cursor: pointer; }
+  .hint { color: #777; font-size: .8rem; }
+</style>
+</head>
+<body>
+<header><h1>Log Analyser</h1></header>
+<main>
+  <section>
+    <form id="upload-form">
+      <input type="file" id="file-input" accept=".log,.txt" required>
+      <button type="submit">Upload</button>
+      <span id="upload-status"></span>
+    </form>
+  </section>
+
+  <section>
+    <label>File <select id="file-select"></select></label>
+    <button id="delete-file">Delete file</button>
+    <span id="file-status"></span>
+  </section>
+
+  <section id="filters">
+    <fieldset><legend>Level</legend>
+      <label><input type="checkbox" value="TRACE" checked> TRACE</label>
+      <label><input type="checkbox" value="DEBUG" checked> DEBUG</label>
+      <label><input type="checkbox" value="INFO" checked> INFO</label>
+      <label><input type="checkbox" value="WARN" checked> WARN</label>
+      <label><input type="checkbox" value="ERROR" checked> ERROR</label>
+      <label><input type="checkbox" value="FATAL" checked> FATAL</label>
+    </fieldset>
+    <label>Start (UTC) <input type="datetime-local" id="f-start"></label>
+    <label>End (UTC) <input type="datetime-local" id="f-end"></label>
+    <label>Keyword <input type="search" id="f-q" placeholder="substring match"></label>
+    <button id="apply">Apply</button>
+    <button id="reset" type="button">Reset</button>
+  </section>
+  <p class="hint">Start/end times are interpreted as UTC.</p>
+
+  <div id="error-box" hidden></div>
+
+  <section>
+    <div class="card">Total entries<b id="m-total">–</b></div>
+    <div class="card">Errors<b id="m-errors">–</b></div>
+    <div class="card">Warnings<b id="m-warn">–</b></div>
+  </section>
+
+  <section>
+    <canvas id="level-chart"></canvas>
+    <canvas id="time-chart"></canvas>
+  </section>
+
+  <section>
+    <h2>Top repeated errors</h2>
+    <ol id="top-list"></ol>
+    <p class="hint" id="top-empty" hidden>No repeated ERROR/FATAL messages.</p>
+  </section>
+
+  <section>
+    <table>
+      <thead><tr><th>Time (UTC)</th><th>Level</th><th>Message</th></tr></thead>
+      <tbody id="log-body"></tbody>
+    </table>
+    <div id="empty" hidden>No log entries match the current filters.</div>
+    <div>
+      <button id="prev">Prev</button>
+      <span id="page-info"></span>
+      <button id="next">Next</button>
+    </div>
+  </section>
+</main>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const PAGE = 50;
+const LEVEL_COLORS = { TRACE:"#aaa", DEBUG:"#888", INFO:"#2b7cd3", WARN:"#e8912d", ERROR:"#d64545", FATAL:"#8e2de2" };
+let page = 0, total = 0;
+const charts = {};
+
+// ---------- helpers ----------
+function showError(msg) { const e = $("error-box"); e.textContent = msg; e.hidden = false; }
+function clearError() { $("error-box").hidden = true; }
+
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+  return body;
+}
+
+// datetime-local "YYYY-MM-DDTHH:MM[:SS]" -> UTC ISO string for the API
+function toUTC(v) { return v.length === 16 ? v + ":00Z" : v + "Z"; }
+
+// current filter state as a query string (shared by /api/logs and /api/metrics)
+function filterQS(extra = {}) {
+  const p = new URLSearchParams();
+  const fid = $("file-select").value;
+  if (fid) p.set("file_id", fid);
+  document.querySelectorAll("#filters input[type=checkbox]:checked")
+    .forEach(c => p.append("level", c.value));
+  if ($("f-start").value) p.set("start", toUTC($("f-start").value));
+  if ($("f-end").value) p.set("end", toUTC($("f-end").value));
+  if ($("f-q").value.trim()) p.set("q", $("f-q").value.trim());
+  for (const [k, v] of Object.entries(extra)) p.set(k, v);
+  return p.toString();
+}
+
+function chart(id, cfg) { if (charts[id]) charts[id].destroy(); charts[id] = new Chart($(id), cfg); }
+
+// ---------- data loading ----------
+async function loadFiles() {
+  const files = await api("/api/files");
+  const sel = $("file-select");
+  const prev = sel.value;
+  sel.textContent = "";
+  for (const f of files) {
+    const o = document.createElement("option");
+    o.value = f.id;
+    o.textContent = `${f.filename} (${f.entry_count})`;
+    sel.appendChild(o);
+  }
+  // keep selection if possible, else select newest (last) file
+  sel.value = files.some(f => String(f.id) === prev) ? prev : (files.at(-1)?.id ?? "");
+  if (!files.length) $("file-status").textContent = "No files uploaded yet.";
+}
+
+async function refresh() {
+  clearError();
+  try {
+    const qs = filterQS();
+    // fetch table page and metrics in parallel
+    const [logs, metrics] = await Promise.all([
+      api(`/api/logs?${qs}&limit=${PAGE}&offset=${page * PAGE}`),
+      api(`/api/metrics?${qs}`),
+    ]);
+    total = logs.total;
+    renderMetrics(metrics);
+    renderCharts(metrics);
+    renderTop(metrics.top_messages);
+    renderTable(logs.rows);
+    renderPager();
+  } catch (err) { showError(err.message); }
+}
+
+// ---------- rendering ----------
+function renderMetrics(m) {
+  $("m-total").textContent = m.total;
+  $("m-errors").textContent = (m.by_level.ERROR || 0) + (m.by_level.FATAL || 0);
+  $("m-warn").textContent = m.by_level.WARN || 0;
+}
+
+function renderCharts(m) {
+  const levels = Object.keys(m.by_level);
+  chart("level-chart", {
+    type: "bar",
+    data: { labels: levels, datasets: [{ label: "entries",
+      data: levels.map(l => m.by_level[l]),
+      backgroundColor: levels.map(l => LEVEL_COLORS[l] || "#999") }] },
+    options: { plugins: { title: { display: true, text: "Entries per level" } } },
+  });
+  const labels = m.series.map(b => b.bucket.length > 13 ? b.bucket.slice(11, 16) : b.bucket.slice(11) + ":00");
+  chart("time-chart", {
+    data: { labels, datasets: [
+      { type: "bar", label: "entries", data: m.series.map(b => b.count), backgroundColor: "#2b7cd355" },
+      { type: "line", label: "errors", data: m.series.map(b => b.errors), borderColor: "#d64545", tension: .2 },
+    ]},
+    options: { plugins: { title: { display: true, text: "Entries per time bucket (red = ERROR/FATAL)" } } },
+  });
+}
+
+function renderTop(msgs) {
+  const ol = $("top-list");
+  ol.textContent = "";
+  $("top-empty").hidden = msgs.length > 0;
+  for (const t of msgs) {
+    const li = document.createElement("li");
+    li.textContent = `${t.first_line}  ×${t.count}`;  // textContent: untrusted log data
+    ol.appendChild(li);
+  }
+}
+
+function renderTable(rows) {
+  const tb = $("log-body");
+  tb.textContent = "";
+  $("empty").hidden = rows.length > 0;
+  for (const r of rows) {
+    const tr = document.createElement("tr");
+    const tdT = document.createElement("td"); tdT.textContent = r.timestamp;
+    const tdL = document.createElement("td");
+    const badge = document.createElement("span");
+    badge.className = "badge " + r.level; badge.textContent = r.level;
+    tdL.appendChild(badge);
+    const tdM = document.createElement("td"); tdM.className = "msg";
+    const lines = r.message.split("\n");
+    if (lines.length === 1) {
+      tdM.textContent = r.message;
+    } else {
+      tdM.textContent = lines[0];
+      const more = document.createElement("span");
+      more.className = "expand"; more.textContent = ` … +${lines.length - 1} lines`;
+      more.onclick = () => {  // expand/collapse full message
+        tdM.textContent = "";
+        const pre = document.createElement("pre");
+        pre.textContent = r.message;
+        tdM.appendChild(pre);
+      };
+      tdM.appendChild(more);
+    }
+    tr.append(tdT, tdL, tdM);
+    tb.appendChild(tr);
+  }
+}
+
+function renderPager() {
+  const pages = Math.max(1, Math.ceil(total / PAGE));
+  $("page-info").textContent = `Page ${page + 1} of ${pages}`;
+  $("prev").disabled = page === 0;
+  $("next").disabled = (page + 1) * PAGE >= total;
+}
+
+// ---------- events ----------
+$("upload-form").addEventListener("submit", async ev => {
+  ev.preventDefault();
+  const input = $("file-input");
+  if (!input.files.length) return;
+  const fd = new FormData();
+  fd.append("file", input.files[0]);
+  try {
+    const r = await api("/api/upload", { method: "POST", body: fd });
+    $("upload-status").textContent = `parsed ${r.parsed} / skipped ${r.skipped}`;
+    await loadFiles();
+    $("file-select").value = r.file_id;
+    page = 0; refresh();
+  } catch (err) { showError(`Upload failed: ${err.message}`); }
+});
+
+$("file-select").addEventListener("change", () => { page = 0; refresh(); });
+$("apply").addEventListener("click", () => { page = 0; refresh(); });
+$("reset").addEventListener("click", () => {
+  $("f-start").value = $("f-end").value = $("f-q").value = "";
+  document.querySelectorAll("#filters input[type=checkbox]").forEach(c => c.checked = true);
+  page = 0; refresh();
+});
+$("prev").addEventListener("click", () => { if (page > 0) { page--; refresh(); } });
+$("next").addEventListener("click", () => { page++; refresh(); });
+
+// two-click delete to avoid a blocking confirm() dialog
+$("delete-file").addEventListener("click", async () => {
+  const fid = $("file-select").value;
+  const btn = $("delete-file");
+  if (btn.dataset.arm !== "1") {
+    btn.dataset.arm = "1"; btn.textContent = "Click again to confirm";
+    setTimeout(() => { btn.dataset.arm = ""; btn.textContent = "Delete file"; }, 3000);
+    return;
+  }
+  try {
+    await api(`/api/files/${fid}`, { method: "DELETE" });
+    $("file-status").textContent = "File deleted.";
+    await loadFiles(); page = 0; refresh();
+  } catch (err) { showError(err.message); }
+});
+
+loadFiles().then(refresh);
+</script>
+</body>
+</html>

@@ -1,0 +1,20 @@
+2026-11-18 14:32:01 INFO server started on port 5000
+garbage line with no format
+2026-11-18 14:32:05 ERROR connection refused to db.internal:5432
+Traceback (most recent call last):
+  File "app.py", line 42, in connect
+    raise ConnectionError("db.internal unreachable")
+ConnectionError: db.internal unreachable
+2026-11-18 14:32:06 WARN retrying connection (attempt 2/3)
+2026-11-18 14:32:09 DEBUG pool size=4 idle=2
+2026-11-18 14:33:00 FATAL giving up after 3 attempts
+[INFO] 2026-11-18T14:35:12Z health check ok
+???
+[ERROR] 2026-11-18T14:35:40.250+00:00 upstream timeout after 30s
+[WARN] 2026-11-18T14:35:41+02:00 cache miss rate above threshold
+Nov 18 14:40:01 web01 nginx[812]: INFO GET /api/logs 200 12ms
+!!! corrupted !!!
+    while reading response header from upstream
+Nov 18 14:40:02 web01 nginx[812]: ERROR upstream prematurely closed connection
+Nov 18 14:40:03 web01 nginx[812]: DEBUG worker 3 spawned
+2026-13-45 99:99:99 INFO invalid date values should not parse
